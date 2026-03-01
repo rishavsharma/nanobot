@@ -54,7 +54,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 100000,
         memory_window: int = 100,
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
@@ -106,7 +106,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -185,8 +185,11 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        logger.debug("AgentLoop starting with {} messages", len(messages))
+
         while iteration < self.max_iterations:
             iteration += 1
+            logger.debug("AgentLoop iteration {}/{}", iteration, self.max_iterations)
 
             response = await self.provider.chat(
                 messages=messages,
@@ -221,15 +224,31 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                iteration_chars = 0
+                max_iteration_chars = 100000
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    logger.debug("Executing tool: {} with ID {}", tool_call.name, tool_call.id)
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    result_str = str(result)
+                    if iteration_chars + len(result_str) > max_iteration_chars:
+                        allowed = max(0, max_iteration_chars - iteration_chars)
+                        if allowed > 0:
+                            result_str = result_str[:allowed] + "\n... [System: Tool output truncated to fit context budget]"
+                        else:
+                            result_str = "[System: Tool skipped entirely to fit context budget]"
+                        logger.warning("Truncated output for {} to fit budget", tool_call.name)
+                    iteration_chars += len(result_str)
+                    
+                    logger.debug("Tool {} returned {} chars", tool_call.name, len(result_str))
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_call.name, result_str
                     )
             else:
+                logger.debug("No tool calls; finishing agent loop.")
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
@@ -289,11 +308,15 @@ class AgentLoop:
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message under the session lock."""
+        logger.debug("Dispatching message for session {} at {}", msg.session_key, msg.timestamp)
+        session_lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        async with session_lock:
+            logger.debug("Processing lock acquired for message at {}", msg.timestamp)
             try:
                 response = await self._process_message(msg)
                 if response is not None:
+                    logger.debug("Publishing response for message at {}", msg.timestamp)
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
@@ -372,6 +395,8 @@ class AgentLoop:
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
                             )
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
@@ -380,6 +405,9 @@ class AgentLoop:
                 )
             finally:
                 self._consolidating.discard(session.key)
+                # Only remove the lock if we are the ones holding it (which we just released) or if no one is waiting
+                if not lock.locked():
+                    self._consolidation_locks.pop(session.key, None)
 
             session.clear()
             self.sessions.save(session)
@@ -391,7 +419,8 @@ class AgentLoop:
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+        unconsolidated_chars = sum(len(str(m)) for m in session.messages[session.last_consolidated:])
+        if (unconsolidated >= self.memory_window or unconsolidated_chars > 100000) and session.key not in self._consolidating:
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
@@ -399,6 +428,10 @@ class AgentLoop:
                 try:
                     async with lock:
                         await self._consolidate_memory(session)
+                except asyncio.CancelledError:
+                    logger.debug("Memory consolidation cancelled for {}", session.key)
+                except Exception:
+                    logger.exception("Background consolidation failed for {}", session.key)
                 finally:
                     self._consolidating.discard(session.key)
                     _task = asyncio.current_task()
@@ -414,12 +447,14 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
+        logger.debug("Loaded {} history messages for {}", len(history), session.key)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+        logger.debug("Built context with {} items", len(initial_messages))
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})

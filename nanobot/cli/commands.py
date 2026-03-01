@@ -210,7 +210,33 @@ def _make_provider(config: Config):
 
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider, ReasoningEffort, ReasoningSummary, TextVerbosity
+
+        effort: ReasoningEffort = "medium"
+        summary: ReasoningSummary = "auto"
+        verbosity: TextVerbosity = "medium"
+
+        if p and p.extra_headers:
+            # Effort: none | minimal | low | medium | high | xhigh | extra_high
+            raw_effort = p.extra_headers.get("X-Reasoning-Effort", "medium").lower().replace("-", "_")
+            if raw_effort in ("none", "minimal", "low", "medium", "high", "xhigh", "extra_high"):
+                effort = raw_effort  # type: ignore[assignment]
+            # Summary: auto | concise | detailed | off | on
+            raw_summary = p.extra_headers.get("X-Reasoning-Summary", "auto").lower()
+            if raw_summary in ("auto", "concise", "detailed", "off", "on"):
+                summary = raw_summary  # type: ignore[assignment]
+            # Verbosity: low | medium | high
+            raw_verbosity = p.extra_headers.get("X-Text-Verbosity", "medium").lower()
+            if raw_verbosity in ("low", "medium", "high"):
+                verbosity = raw_verbosity  # type: ignore[assignment]
+
+        return OpenAICodexProvider(
+            default_model=model,
+            reasoning_effort=effort,
+            reasoning_summary=summary,
+            text_verbosity=verbosity,
+        )
+
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
     if provider_name == "custom":

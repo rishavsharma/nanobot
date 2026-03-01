@@ -296,7 +296,7 @@ class WebToolsConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
-    timeout: int = 60
+    timeout: int = 300
     path_append: str = ""
 
 

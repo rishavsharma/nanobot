@@ -109,18 +109,21 @@ class WebFetchTool(Tool):
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
             "extractMode": {"type": "string", "enum": ["markdown", "text"], "default": "markdown"},
-            "maxChars": {"type": "integer", "minimum": 100}
+            "maxChars": {"type": "integer", "minimum": 100},
+            "timeout": {"type": "integer", "description": "Optional specific timeout in seconds"}
         },
         "required": ["url"]
     }
-
-    def __init__(self, max_chars: int = 50000):
+    
+    def __init__(self, max_chars: int = 50000, default_timeout: float = 30.0):
         self.max_chars = max_chars
-
-    async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
+        self.default_timeout = default_timeout
+    
+    async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, timeout: int | None = None, **kwargs: Any) -> str:
         from readability import Document
 
         max_chars = maxChars or self.max_chars
+        req_timeout = timeout if timeout is not None else self.default_timeout
 
         # Validate URL before fetching
         is_valid, error_msg = _validate_url(url)
@@ -131,7 +134,7 @@ class WebFetchTool(Tool):
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 max_redirects=MAX_REDIRECTS,
-                timeout=30.0
+                timeout=req_timeout
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
